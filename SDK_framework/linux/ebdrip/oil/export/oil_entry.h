@@ -78,7 +78,7 @@ void  OIL_SetTECData(int **TecCriteria);
 void  OIL_OutputTECValue(char *message);
 
 void *OIL_HWA1_GIPA2_Interface(unsigned int *plength);
-void *OIL_HWA1_GIPA2_Dither(unsigned int *plength, const unsigned char **Data, const unsigned int *Length, const unsigned char **CellSize);
+void *OIL_HWA1_GIPA2_Dither(unsigned int *plength, const unsigned char **Data, const unsigned int *Length, const unsigned char **CellSize, unsigned int Id);
 void *OIL_HWA1_GIPA2_Gamma(unsigned int *plength, const unsigned char *Data, const unsigned int Length);
 void *OIL_HWA1_GIPA2_BGUCR(unsigned int *plength, const unsigned char *Data, const unsigned int Length);
 void *OIL_HWA1_GIPA2_CMM(unsigned int *plength, const unsigned char *Data, const unsigned int Length);

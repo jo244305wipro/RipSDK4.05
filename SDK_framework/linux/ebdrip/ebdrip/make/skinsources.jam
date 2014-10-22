@@ -114,6 +114,8 @@ AddToVar Local : SkinSources :
   pms$/src$/pms_filesys.h
   pms$/src$/hwa1_BGUCR.c
   pms$/src$/hwa1_dither.c
+  pms$/src$/hwa1_dither2.c
+  pms$/src$/hwa1_dither4.c
   pms$/src$/hwa1_gamma.c
   pms$/src$/hwa1_cell1bit.c
   pms$/src$/hwa1_cell2bit.c

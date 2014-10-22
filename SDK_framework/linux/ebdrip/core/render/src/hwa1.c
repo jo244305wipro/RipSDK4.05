@@ -56,6 +56,11 @@
 /* -------------------------------------------------------------------------- */
 /* Build options */
 
+/* Define this to generate DRAW_RUN commands using shared span buckets. Leave
+ * undefined to emit DRAW_RUN_REPEATs for single scanlines. */
+
+#define HWA1_SPAN_BUCKETS
+
 /* Define this to cause final band to be the exact remaining number of rows.
  * Leave it undefined to keep all bands the same height. */
 
@@ -243,6 +248,7 @@ static void hwa1_metrics_reset(int reason)
 #define ITSA_USER    0xE2050000
 #define ITSA_CELL    0x11CE0000
 #define ITSA_PATTERN 0x287EA709
+#define ITSA_BUCKET  0xE7C7B000
 #define ITSA_DEFAULT 0
 
 /* Trivial list of buffered assets */
@@ -257,8 +263,8 @@ typedef struct assetlist {
 
 typedef struct hwa_state_t {
   /* HWA1 state */
-  uint8   HWA_ROP2 ;        /* The HWA1's current ROP2 */
-  uint8   DL_ROP2 ;         /* ROP2 of the next DL object */
+  uint8   HWA_ROP2 ;          /* The HWA1's current ROP2 */
+  uint8   DL_ROP2 ;           /* ROP2 of the next DL object */
 
   PclDLPattern *HWA_pattern ; /* The pattern set as the HWA1 brush */
   PclDLPattern *DL_pattern ;  /* The PCL pattern to set. */
@@ -267,6 +273,8 @@ typedef struct hwa_state_t {
 
   PclPackedColor HWA_color ;  /* The HWA1's current SET_COLOR */
   PclPackedColor DL_color ;   /* Color of the next DL object */
+  int HWA_channels ;          /* Colorspace of current HWA color */
+  int DL_channels ;           /* Colorspace of next DL object - RGB or gray */
 
   Bool sTrans ;               /* Source is transparent. */
 
@@ -287,11 +295,18 @@ typedef struct hwa_state_t {
   assetlist * assets ;      /* List of assets in the buffer (end..length) */
   gipa2_com_head * head ;   /* The most recent COM_HEAD (ie previous band) */
 
-  /* Dither threshold addresses in the current buffer */
+  /* Scanline bucket */
+  uint8 * bucket ;          /* pointer into current scanline bucket or NULL */
+  uint8 * rim ;             /* the end of the scanline bucket */
+
+  /* Dither threshold addresses in the current buffer for SET_COLOR */
   uint8 * Kdither ;
   uint8 * Cdither ;
   uint8 * Mdither ;
   uint8 * Ydither ;
+
+  /* Stretchblt dither address in the current buffer for STRETCHBLT */
+  gipa2_set_dither_stretchblt * dither ;
 
   /* Admin */
   int32 error ;             /* An HWA1 error number, see below */
@@ -329,6 +344,13 @@ enum {
 } ;
 
 #define HWA1_BAND_STATE_NAME "HWA1 band state"
+
+#define SPAN2_LEN (3*2)
+#define SPAN4_LEN (3*4)
+
+/* Span bucket sizes */
+#define BUCKET2_LEN (42 * SPAN2_LEN + 2)
+#define BUCKET4_LEN (21 * SPAN4_LEN + 4)
 
 /* -------------------------------------------------------------------------- */
 /* The HWA API is provided by the skin via RDR. */
@@ -464,7 +486,7 @@ static Bool get_hwa1_buffer(hwa1_state_t * state)
 }
 
 /* Unique identifiers for asset management */
-uint8 cache_id[8] ;
+uint8 cache_id[16] ;
 #define DITHER_CACHE (&cache_id[0])
 #define CLIP_ASSET   (&cache_id[1])
 #define ONE_OFF      (&cache_id[2])
@@ -472,6 +494,8 @@ uint8 cache_id[8] ;
 #define CELL_M       (&cache_id[4])
 #define CELL_Y       (&cache_id[5])
 #define CELL_K       (&cache_id[6])
+#define SPAN_BUCKET  (&cache_id[7])
+#define SOLID_BRUSH  (&cache_id[8])
 
 /* Set up the state with a new buffer, potentially initialised with any assets
    or setup commands shared between bands in the buffer.
@@ -658,6 +682,8 @@ static Bool hwa1_buffer_assets(hwa1_state_t * state, Bool separate)
       }
     }
   }
+  /* Remember this for DRAW_STRETCHBLT's halftone phase calculation */
+  state->dither = dither ;
 
   /* And the dither size, for SET_COLOR's benefit */
   state->Kdither = state->Cdither = state->Mdither = state->Ydither = NULL ;
@@ -845,6 +871,11 @@ static Bool hwa1_new_buffer(hwa1_state_t *state)
   state->assets = NULL ;
   state->head   = NULL ;    /* We don't do COM_HEAD until band_start */
   state->prev   = NULL ;
+  state->bucket = NULL ;
+
+  /* Definitely no dithers in the buffer */
+  state->Cdither = state->Mdither = state->Ydither = state->Kdither = NULL ;
+  state->dither = NULL ;
 
   /* Now the shared assets and setup commands... */
   if ((state->config.options & HWA1_OPT_DEFER_BUFFER_ASSETS) == 0) {
@@ -1323,7 +1354,7 @@ static Bool hwa1_select(surface_instance_t **instance, const sw_datum *pagedict,
     
     /* Find the HWA API. If there isn't one we can't continue. */
     if (SwFindRDR(RDR_CLASS_API, RDR_API_HWA, 20140721, &vp, NULL)
-      != SW_RDR_SUCCESS || vp == 0)
+        != SW_RDR_SUCCESS || vp == 0)
       return error_handler(UNREGISTERED) ;   /* HWA API is required */
     hwa_api = (hwa_api_20140721 *)vp ;
 
@@ -1347,6 +1378,8 @@ static void hwa1_state_reset(hwa1_state_t * state)
   
   state->DL_color = PCL_PACKED_RGB_BLACK ;   /* must not == DL_color! */
   state->HWA_color = PCL_PACKED_RGB_INVALID ; 
+  state->DL_channels = 99 ;
+  state->HWA_channels = 0 ;
 
   bbox_clear(&state->rectclip) ;
   bbox_clear(&state->bandclip) ;
@@ -1850,6 +1883,14 @@ static inline void rgbToCmyk(uint8 cmyk[4], PclPackedColor rgb)
   cmyk[0] = c-k ; cmyk[1] = m-k ; cmyk[2] = y-k ; cmyk[3] = k ;
 }
 
+static inline void grayToCmyk(uint8 cmyk[4], PclPackedColor rgb)
+{
+  uint8 k = 255 & (uint8)rgb ;
+  /* GIPA2 order is CMYK */
+  cmyk[0] = 0 ; cmyk[1] = 0 ; cmyk[2] = 0 ; cmyk[3] = k ;
+}
+
+#if 0
 /* For K only mode - gray actually goes in the C byte */
 
 static inline void rgbToGray(uint8 cmyk[4], PclPackedColor rgb)
@@ -1862,6 +1903,7 @@ static inline void rgbToGray(uint8 cmyk[4], PclPackedColor rgb)
   /* Only first is used for gray */
   cmyk[0] = 255 & (k >> 16) ; cmyk[1] = 0 ; cmyk[2] = 0 ; cmyk[3] = 0 ;
 }
+#endif
 
 /* ========================================================================== */
 
@@ -1974,15 +2016,14 @@ static size_t brush_required(hwa1_state_t *state)
   size_t required = 0 ;
 
   if (state->HWA_pattern != state->DL_pattern ||
-      state->HWA_pTrans != state->DL_pTrans) {
-    /** \todo ajcd 2013-08-12: Assume that we need GIPA2_SET_BRUSH to clear
-        the brush, but we can have one with no data and zero width and
-        height. */
-    if ( state->DL_pattern != NULL ) {
-      uint8 *data = hwa1_find_asset(state, state->DL_pattern, 0) ;
-      if ( data == NULL )
-        required += sizeof(assetlist) + 64 * 8 ; /* 64x64bit */
-    }
+      state->HWA_pTrans  != state->DL_pTrans) {
+    uint8 * brushptr = (uint8 *) state->DL_pattern ;
+    uint8 * data ;
+    if (!brushptr)
+      brushptr = SOLID_BRUSH ;
+    data = hwa1_find_asset(state, brushptr, 0) ;
+    if (!data)
+      required += sizeof(assetlist) + 64 * 8 ; /* 64x64bit */
 
     required += sizeof(gipa2_set_brush) ;
   }
@@ -1995,20 +2036,27 @@ static void brush_update(DL_STATE *page, hwa1_state_t *state)
 {
   if (state->HWA_pattern != state->DL_pattern ||
       state->HWA_pTrans != state->DL_pTrans) {
-    gipa2_set_brush *brush ;
+    PclDLPattern * pattern = state->DL_pattern ; /* may be null */
+    uint8 * data, * brushptr = (pattern) ? (uint8 *) pattern : SOLID_BRUSH ;
+    gipa2_set_brush * brush ;
+    uint8 width, height ;
 
-    GET_CMD(brush, state, GIPA2_SET_BRUSH) ;
-    NOP(brush->nop1) ;
-    NOP(brush->nop2) ;
-    NOP(brush->nop3) ;
-    brush->flags   = state->DL_pTrans ? GIPA2_BRUSH_TRANS : GIPA2_BRUSH_OPAQUE ;
-    brush->xoffset = 0 ;
-    brush->yoffset = 0 ;
+    data = hwa1_find_asset(state, brushptr, 0) ;
 
-    if ( state->DL_pattern != NULL ) {
-      PclDLPattern* pattern = state->DL_pattern;
-      uint8 *data = hwa1_find_asset(state, pattern, 0) ;
-      if (!data) {
+    width  = (pattern) ? (uint8) pattern->width  : 64 ;
+    height = (pattern) ? (uint8) pattern->height : 64 ;
+      
+    if (!data) {
+      data = hwa1_add_asset(state, ITSA_PATTERN, brushptr, 64 * 8, 0) ;
+      HQASSERT(data, "Couldn't allocate brush asset") ;
+#     ifdef HWA1_METRICS
+        hwa1_metrics.opcodes[GIPA2_SET_BRUSH].assets += 64 * 8 ;
+#     endif
+
+      if (!pattern) {
+        /* Define solid pattern */
+        HqMemSet8(data, 0xFF, 64 * 8) ;
+      } else {
         uint32 x, y ;
         dl_color_t dlc_white ;
         p_ncolor_t nc_white ;
@@ -2020,12 +2068,6 @@ static void brush_update(DL_STATE *page, hwa1_state_t *state)
         dlc_clear(&dlc_white) ;
         dlc_get_white(page->dlc_context, &dlc_white) ;
         dlc_to_dl_weak(&nc_white, &dlc_white) ;
-
-        data = hwa1_add_asset(state, ITSA_PATTERN, pattern, 64*8, 0) ;
-        HQASSERT(data, "Couldn't allocate brush asset") ;
-#       ifdef HWA1_METRICS
-          hwa1_metrics.opcodes[GIPA2_SET_BRUSH].assets += 64 * 8 ;
-#       endif
 
         for ( y = 0 ; y < 64 ; ++y ) {
           dcoord w = 64 ;
@@ -2046,18 +2088,23 @@ static void brush_update(DL_STATE *page, hwa1_state_t *state)
 
             pclDLPatternIteratorNext(&iterator, w) ;
           }
-        }
-      }
-      brush->width   = CAST_UNSIGNED_TO_UINT8(pattern->width) ;
-      brush->height  = CAST_UNSIGNED_TO_UINT8(pattern->height) ;
-      brush->data    = PTR32(data) ;
-    } else {
-      brush->width   = 0 ;
-      brush->height  = 0 ;
-      brush->data    = NULL ;
-    }
+        } /* for y */
+      } /* if pattern */
+    } /* if !data */
+
+    GET_CMD(brush, state, GIPA2_SET_BRUSH) ;
+    NOP(brush->nop1) ;
+    NOP(brush->nop2) ;
+    NOP(brush->nop3) ;
+    brush->flags   = state->DL_pTrans ? GIPA2_BRUSH_TRANS : GIPA2_BRUSH_OPAQUE ;
+    brush->xoffset = 0 ;
+    brush->yoffset = 0 ;
+    brush->width   = CAST_UNSIGNED_TO_UINT8(width) ;
+    brush->height  = CAST_UNSIGNED_TO_UINT8(height) ;
+    brush->data    = PTR32(data) ;
 
     state->HWA_pattern = state->DL_pattern ;
+    state->HWA_pTrans  = state->DL_pTrans ;
   }
 }
 
@@ -2066,8 +2113,17 @@ static void brush_update(DL_STATE *page, hwa1_state_t *state)
  *
  * options: b0 reflect X axis
  *          b1 reflect Y axis
- *          b2 GIPA2 X ordering (x0,x1,0,0,x2,x3,0,0... 128 bytes per line)
+ *          b2 GIPA2 X ordering (otherwise w*h consecutive bytes)
+ *             1bpp: a0,a1,0,0, a2,a3,0,0... 128 bytes per line
+ *             2bpp: a0,b0,c0,0, a1,b1,c1,0... 256 bytes per line
+ *             4bpp: 15 bytes per pixel padded to 16, contiguous
  */
+
+enum {
+  REFLECT_X = 1,
+  REFLECT_Y = 2,
+  GIPA2_ORDER = 4
+} ;
 
 uint8 * hwa1_cell(hwa1_state_t * state, uint8 * threshold, int w, int h,
                   uint8 * type, int level, int options)
@@ -2077,26 +2133,69 @@ uint8 * hwa1_cell(hwa1_state_t * state, uint8 * threshold, int w, int h,
   int bitdepth = state->config.bitDepth ;
   int levels = 1 << bitdepth ;
 
+  outstride = ((w * bitdepth + 31) & ~31) >> 3 ;
+
   cell = hwa1_add_asset(state, ITSA_CELL, type, HWA1_CELL_SIZE(w, h), level) ;
   if (!cell)
     return NULL ;
 
+  /* GIPA2 ordering implies no mirroring */
+  if ((options & GIPA2_ORDER) != 0)
+    options &= ~(REFLECT_X | REFLECT_Y) ;
+
+  if ((options & GIPA2_ORDER) != 0 && bitdepth > 1) {
+    /* GIPA2 multi-threshold format - 3 or 15 thresholds per pixel. */
+    int num  = (bitdepth == 2) ? 4 : 16 ;
+    int y, max  = num - 1 ;
+    instride = (bitdepth == 2) ? 256 : 640 ;
+
+    for (y = 0 ; y < h ; ++y) {
+      int x, bits = 0 ;
+      uint32 shift = 0 ;
+      uint8 * in = threshold + y * instride ;
+      uint8 * pad, *out = pad = cell + y * outstride ;
+
+      for (x = 0 ; x < w ; ++x) {
+        /* 3 or 15 thresholds followed by a zero. */
+        uint8 * row = in + x * num ;
+        int t ;
+        for (t = 0 ; t < max && level >= row[t] ; ++t) ;
+        /* t is bitpattern */
+        shift = (shift << bitdepth) | t ;
+        bits += bitdepth ;
+        if (bits >= 8) {
+          bits -= 8 ;
+          *out++ = 255 & (shift >> bits) ;
+          shift &= (1 << bits) - 1 ;
+        }
+      } /* for x */
+      /* Final word of a line needs to be padded with bits from first word */
+      if (bits > 0 || ((out - pad) & 3) != 0) {
+        in = pad ;
+        do {
+          *out++ = 255 & ((shift << (8 - bits)) | (*in >> bits)) ;
+          shift = *in++ ;
+        } while (((out - pad) & 3) != 0) ;
+      }
+    } /* for y */
+
+    return cell ;
+  } /* else single-threshold per pixel... */
+
   /* Adjustment for thresholding with >1 bit depth */
   level = (level * (257 - levels) + 127) >> 8 ;
 
-  instride = (options & 4) ? 128 : (w + 3) &~3 ;
-  outstride = ((w * bitdepth + 31) &~31) >> 3 ;
-
+  instride = (options & GIPA2_ORDER) ? 128 : (w + 3) & ~3 ;
   for (j = 0 ; j < h ; ++j) {
-    int y = (options & 2) ? h - j - 1 : j ;
+    int y = (options & REFLECT_Y) ? h - j - 1 : j ;
     int bits = 0 ;
     uint32 shift = 0 ;
     uint8 * in = threshold + y * instride ;
     uint8 * pad, * out = pad = cell + y * outstride ;
 
     for (i = 0 ; i < w ; ++i) {
-      int x = (options & 1) ? w - i - 1 : i ;
-      int t = (options & 4) ? in[x * 2 - (x & 1)] : in[x] ;
+      int x = (options & REFLECT_X) ? w - i - 1 : i ;
+      int t = (options & GIPA2_ORDER) ? in[x * 2 - (x & 1)] : in[x] ;
       t = level - t ;
       if (t < 0)
         t = 0 ;
@@ -2131,7 +2230,8 @@ static size_t color_required(hwa1_state_t * state, Bool indexed)
 {
   size_t required ;
 
-  if (state->HWA_color == state->DL_color)
+  if (state->HWA_color == state->DL_color &&
+      state->HWA_channels == state->DL_channels)
     return 0 ;
 
   if (indexed)
@@ -2152,7 +2252,11 @@ static size_t color_required(hwa1_state_t * state, Bool indexed)
     /* No predefined/preloaded cells, so we're into asset management. */
     uint8 * C, * M, * Y, * K ;
     uint8 cmyk[4] ;
-    rgbToCmyk(cmyk, state->DL_color) ;
+
+    if (state->DL_channels == 1)
+      grayToCmyk(cmyk, state->DL_color) ;
+    else
+      rgbToCmyk(cmyk, state->DL_color) ;
 
     C = hwa1_find_asset(state, CELL_C, cmyk[0]) ;
     M = hwa1_find_asset(state, CELL_M, cmyk[1]) ;
@@ -2204,9 +2308,11 @@ static void color_update(hwa1_state_t * state, Bool indexed)
   gipa2_set_color * color ;
   uint8 cmyk[4] ;
 
-  if (state->HWA_color == state->DL_color)
+  if (state->HWA_color == state->DL_color &&
+      state->HWA_channels == state->DL_channels)
     return ;
-  state->HWA_color = state->DL_color ;
+  state->HWA_color    = state->DL_color ;
+  state->HWA_channels = state->DL_channels ;
 
   if (indexed) {
     gipa2_set_indexcolor * index ;
@@ -2218,7 +2324,10 @@ static void color_update(hwa1_state_t * state, Bool indexed)
     index->c0[1] = 0 ;
     index->c0[2] = 0 ;
     index->c0[3] = 0 ;
-    rgbToCmyk(index->c1, state->DL_color) ;
+    if (state->DL_channels == 1)
+      grayToCmyk(index->c1, state->DL_color) ;
+    else
+      rgbToCmyk(index->c1, state->DL_color) ;
 
     return ;
   }
@@ -2228,7 +2337,10 @@ static void color_update(hwa1_state_t * state, Bool indexed)
   NOP(color->nop1) ;
   NOP(color->nop2) ;
   color->bg = GIPA2_COLOR_NOBG ;
-  rgbToCmyk(cmyk, state->DL_color) ;
+  if (state->DL_channels == 1)
+    grayToCmyk(cmyk, state->DL_color) ;
+  else
+    rgbToCmyk(cmyk, state->DL_color) ;
 
   if (state->Kdither) {
     /* predefined/preloaded cells - just address them directly */
@@ -2287,17 +2399,21 @@ static void color_update(hwa1_state_t * state, Bool indexed)
   if (hwa_dither) {
     /* Create the missing cells from the threshold data */
     if (!color->cfore)
-      color->cfore = PTR32(hwa1_cell(state, hwa_dither->Cdata, hwa_dither->Cwidth,
-                               hwa_dither->Cheight, CELL_C, cmyk[0], 4)) ;
+      color->cfore = PTR32(hwa1_cell(state, hwa_dither->Cdata,
+                                     hwa_dither->Cwidth, hwa_dither->Cheight,
+                                     CELL_C, cmyk[0], GIPA2_ORDER)) ;
     if (!color->mfore)
-      color->mfore = PTR32(hwa1_cell(state, hwa_dither->Mdata, hwa_dither->Mwidth,
-                               hwa_dither->Mheight, CELL_M, cmyk[1], 4)) ;
+      color->mfore = PTR32(hwa1_cell(state, hwa_dither->Mdata,
+                                     hwa_dither->Mwidth, hwa_dither->Mheight,
+                                     CELL_M, cmyk[1], GIPA2_ORDER)) ;
     if (!color->yfore)
-      color->yfore = PTR32(hwa1_cell(state, hwa_dither->Ydata, hwa_dither->Ywidth,
-                               hwa_dither->Yheight, CELL_Y, cmyk[2], 4)) ;
+      color->yfore = PTR32(hwa1_cell(state, hwa_dither->Ydata,
+                                     hwa_dither->Ywidth, hwa_dither->Yheight,
+                                     CELL_Y, cmyk[2], GIPA2_ORDER)) ;
     if (!color->kfore)
-      color->kfore = PTR32(hwa1_cell(state, hwa_dither->Kdata, hwa_dither->Kwidth,
-                               hwa_dither->Kheight, CELL_K, cmyk[3], 4)) ;
+      color->kfore = PTR32(hwa1_cell(state, hwa_dither->Kdata,
+                                     hwa_dither->Kwidth, hwa_dither->Kheight,
+                                     CELL_K, cmyk[3], GIPA2_ORDER)) ;
     return ;
   }
 #endif
@@ -2306,13 +2422,17 @@ static void color_update(hwa1_state_t * state, Bool indexed)
    * 16x16 Bayer matrix with suitable offsetting.
    */
   if (!color->cfore)
-    color->cfore = PTR32(hwa1_cell(state, Bayer16x16, 16, 16, CELL_C, cmyk[0], 0)) ;
+    color->cfore = PTR32(hwa1_cell(state, Bayer16x16, 16, 16, CELL_C,
+                                   cmyk[0], 0)) ;
   if (!color->mfore)
-    color->mfore = PTR32(hwa1_cell(state, Bayer16x16, 16,16, CELL_M, cmyk[1], 1)) ;
+    color->mfore = PTR32(hwa1_cell(state, Bayer16x16, 16, 16, CELL_M,
+                                   cmyk[1], REFLECT_X)) ;
   if (!color->yfore)
-    color->yfore = PTR32(hwa1_cell(state, Bayer16x16, 16,16, CELL_Y, cmyk[2], 2)) ;
+    color->yfore = PTR32(hwa1_cell(state, Bayer16x16, 16, 16, CELL_Y,
+                                   cmyk[2], REFLECT_Y)) ;
   if (!color->kfore)
-    color->kfore = PTR32(hwa1_cell(state, Bayer16x16, 16,16, CELL_K, cmyk[3], 3)) ;
+    color->kfore = PTR32(hwa1_cell(state, Bayer16x16, 16, 16, CELL_K,
+                                   cmyk[3], REFLECT_X | REFLECT_Y)) ;
   return ;
 }
 
@@ -2775,8 +2895,12 @@ static surface_prepare_t hwa1_render_prepare(surface_handle_t handle,
     /* The HWA1 brush can only be used for black/white patterns */
     if ( attrib->patternColors == PCL_PATTERN_BLACK_AND_WHITE ) {
       state->DL_pattern = attrib->dlPattern ;
-      state->DL_pTrans = attrib->patternTransparent ;
-    } /* else uses pattern blit layer */
+      state->DL_pTrans  = attrib->patternTransparent ;
+    } else {
+      /* else uses pattern blit layer */
+      /** TODO fixme @@@@ How does the above pattern blit layer get used? */
+      state->DL_pattern = NULL ;
+    }
 
     state->sTrans = attrib->sourceTransparent ;
 
@@ -2803,6 +2927,7 @@ static surface_prepare_t hwa1_render_prepare(surface_handle_t handle,
   blit_color_quantise(color) ;
   blit_color_pack(color) ;
 
+  state->DL_channels = color->nchannels ;
   state->DL_color = color->packed.channels.words[0];
 
   /* Set the ROP regardless of object type. For non-images, set the brush and
@@ -2947,15 +3072,87 @@ static void hwa1_repeat2(hwa1_state_t * state,
                          uint16 y, uint16 x0, uint16 x1, uint16 rows)
 {
   gipa2_draw_run_repeat_2 * repeat = (gipa2_draw_run_repeat_2 *) state->prev ;
-  /* Can we update the previous run repeat? */
-  if (repeat && repeat->opcode == GIPA2_DRAW_RUN_REPEAT &&
-      repeat->coords == GIPA2_COORDS_ARE_2 &&
-      x0 == HWA16(repeat->x0) && x1 == HWA16(repeat->x1) &&
-      y == HWA16(repeat->y) + HWA16(repeat->rows)) {
-    repeat->rows = HWA16(rows + HWA16(repeat->rows)) ;
-    return ;
+  
+  if (repeat) {
+#   ifdef HWA1_SPAN_BUCKETS
+    gipa2_draw_run * run = (gipa2_draw_run *) state->prev ;
+
+    /* Can we update the previous draw_run? */
+    if (rows < 3 && run->opcode == GIPA2_DRAW_RUN &&
+      run->coords == GIPA2_COORDS_ARE_2 &&
+      state->bucket && (state->bucket + SPAN2_LEN * rows) <= state->rim) {
+      uint16 * span = (uint16 *)state->bucket ;
+      uint16 i ;
+      for (i = 0 ; i < rows ; ++i) {
+        *span++ = HWA16(y + i) ;
+        *span++ = HWA16(x0) ;
+        *span++ = HWA16(x1) ;
+      }
+      *span = 0xFFFF ;
+      state->bucket = (uint8 *)span ;
+      if (state->bucket == state->rim)
+        state->bucket = NULL ;
+      return ;
+    }
+#   endif
+
+    /* Can we update the previous run repeat? */
+    if (repeat->opcode == GIPA2_DRAW_RUN_REPEAT &&
+        repeat->coords == GIPA2_COORDS_ARE_2 &&
+        x0 == HWA16(repeat->x0) && x1 == HWA16(repeat->x1) &&
+        y == HWA16(repeat->y) + HWA16(repeat->rows)) {
+      repeat->rows = HWA16(rows + HWA16(repeat->rows)) ;
+      return ;
+    }
   }
-  /* Add a new one */
+  
+# ifdef HWA1_SPAN_BUCKETS
+  if (rows < 3) {
+    /* Start a draw_run instead - though we may already have a span bucket from
+     * an unrelated earlier draw_run. */
+    uint8 * bucket = NULL ;
+    if (state->bucket) {
+      /* If we already have a bucket, skip over the existing terminator and
+       * round up to next 8byte boundary. */
+      bucket = (uint8 *)((((intptr_t)state->bucket) + 2 + 7) & ~7) ;
+    }
+    if (bucket == NULL || bucket + SPAN2_LEN * rows > state->rim) {
+      int size = BUCKET2_LEN ;
+      if (size < SPAN2_LEN * rows + 2)
+        size = SPAN2_LEN * rows + 2 ;
+      /* Need a new bucket. We don't mind if this fails, we know the RUN_REPEAT
+       * will fit. Leave any existing bucket alone. */
+      bucket = hwa1_add_asset(state, ITSA_BUCKET, SPAN_BUCKET, size, 0) ;
+      if (bucket)
+        state->rim = bucket + size - 2 ;  /* leave room for terminator */
+      /* else there was no room for the new span bucket */
+    }
+    if (bucket) {
+      gipa2_draw_run * run ;
+      uint16 * span = (uint16 *) bucket ;
+      uint16 i ;
+
+      GET_CMD(run, state, GIPA2_DRAW_RUN) ;
+      NOP(run->nop1) ;
+      run->coords    = GIPA2_COORDS_ARE_2 ;
+      run->planes    = GIPA2_CMYK ;
+      run->flags     = GIPA2_NOCOMP | GIPA2_NOCLIP ;
+      run->scanlines = PTR32(span) ;
+      for (i = 0 ; i < rows ; ++i) {
+        *span++ = HWA16(y + i) ;
+        *span++ = HWA16(x0) ;
+        *span++ = HWA16(x1) ;
+      }
+      *span = 0xFFFF ;
+      state->bucket = (uint8 *) span ;
+      if (state->bucket == state->rim)
+        state->bucket = NULL ;
+      return ;
+    }
+  }
+# endif
+
+  /* Add a new run_repeat */
   GET_CMD(repeat, state, GIPA2_DRAW_RUN_REPEAT) ;
   NOP(repeat->nop1) ;
   repeat->coords = GIPA2_COORDS_ARE_2 ;
@@ -3461,19 +3658,36 @@ static void hwa1_image(render_blit_t * rb,
           HQASSERT(out + rowlen <= end, "Img overrun") ;
           if (params->dcol >= 0) {
             /* Copy row normally. */
-            HqMemCpy(out, values, rowlen) ;
+            if (params->expanded_comps == 1) {
+              /* Gray is inverted */
+              uint8 * from = (uint8*)values ;
+              size_t j ;
+              for (j = 0 ; j < rowlen ; ++j)
+                out[j] = 255 - from[j] ;
+            } else /* RGB/CMYK straightforward */
+              HqMemCpy(out, values, rowlen) ;
           } else {
             /* Reverse row order while copying */
             uint8 * start = (uint8*) values, * from, * to = out ;
-            if (params->expanded_comps == 3) { /* RGB */
+            switch (params->expanded_comps) {
+            case 3: /* RGB */
               for (from = start + rowlen - 3 ; from >= start ; from -= 3) {
                 *to++ = from[0] ;
                 *to++ = from[1] ;
                 *to++ = from[2] ;
               }
-            } else { /* Gray or anything unexpected */
-              for (from = start + rowlen - 1 ; from >= start ; --from)
+              break ;
+            case 4: /* CMYK */
+              for (from = start + rowlen - 4 ; from >= start ; from -= 4) {
                 *to++ = from[0] ;
+                *to++ = from[1] ;
+                *to++ = from[2] ;
+                *to++ = from[3] ;
+              }
+              break ;
+            default: /* Gray is inverted */
+              for (from = start + rowlen - 1 ; from >= start ; --from)
+                *to++ = 255 - from[0] ;
             }
           }
           out += rowlen ;
@@ -3519,15 +3733,16 @@ static void hwa1_image(render_blit_t * rb,
       stretch->yscale = HWA32((int32)(65536.0 * height / rows + 0.5)) ;
       stretch->x = HWA32(bbox.x1) ;
       stretch->y = HWA32(bbox.y1) ;
-      /** \todo sab 20140725: These should probably be calculated too */
+      /** \todo sab 20141015: X should probably be calculated too */
+#     define YPHASE(y, h) ((h) - 1 - ((y) % (h)))
       stretch->cxoffset = 0 ;
-      stretch->cyoffset = 0 ;
+      stretch->cyoffset = YPHASE(bbox.y1, state->dither->cheight) ;
       stretch->mxoffset = 0 ;
-      stretch->myoffset = 0 ;
+      stretch->myoffset = YPHASE(bbox.y1, state->dither->mheight) ;
       stretch->yxoffset = 0 ;
-      stretch->yyoffset = 0 ;
+      stretch->yyoffset = YPHASE(bbox.y1, state->dither->yheight) ;
       stretch->kxoffset = 0 ;
-      stretch->kyoffset = 0 ;
+      stretch->kyoffset = YPHASE(bbox.y1, state->dither->kheight) ;
       stretch->data = PTR32(dest) ;
       ncols -= cols ;
       left += cols ;

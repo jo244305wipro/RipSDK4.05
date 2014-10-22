@@ -5754,9 +5754,6 @@ static int32 OIL_SetRenderMode( PjlValue * pValue, int fSetDefault )
   {
     PMS_TyJob * pEnvironment = OIL_GetEnvironment( fSetDefault );
 
-    /** TODO FIXME - Temporarily disable RenderMode */
-    return TRUE;
-
     pEnvironment->eRenderMode = pMappedValue->value;
     OIL_UpdateEnvironment( pEnvironment, fSetDefault );
   }

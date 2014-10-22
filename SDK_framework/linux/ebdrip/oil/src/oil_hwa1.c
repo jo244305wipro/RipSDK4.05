@@ -53,7 +53,7 @@ static hwa_api_20140721 OIL_hwa1_interface = {
 static hwa_gipa2_lut    oil_hwa_gipa2_cmm;
 static hwa_gipa2_lut    oil_hwa_gipa2_bgucr;
 static hwa_gipa2_gamma  oil_hwa_gipa2_gamma;
-static hwa_gipa2_dither oil_hwa_gipa2_dither;
+static hwa_gipa2_dither oil_hwa_gipa2_dither[4];
 static hwa_gipa2_user   oil_hwa_gipa2_user;
 
 /* index for the actual FPGA file when required, counts buffers submitted for the current page */
@@ -120,37 +120,38 @@ void *OIL_HWA1_GIPA2_User(unsigned int *plength, const unsigned char *Data, cons
     return (&oil_hwa_gipa2_user);
 }
 
-void *OIL_HWA1_GIPA2_Dither(unsigned int *plength, const unsigned char **Data, const unsigned int *Length, const unsigned char **CellSize)
+void *OIL_HWA1_GIPA2_Dither(unsigned int *plength, const unsigned char **Data, const unsigned int *Length, const unsigned char **CellSize, unsigned int ResourceId)
 {
+  unsigned int index = ResourceId - 1;
 
   if (Data != NULL)
   {
     /* Black Data */
-    oil_hwa_gipa2_dither.Kdata = (unsigned char *)Data[0];
-    oil_hwa_gipa2_dither.Klength = (int16)Length[0];
-    oil_hwa_gipa2_dither.Kwidth = CellSize[0][0];
-    oil_hwa_gipa2_dither.Kheight = CellSize[0][1];
+    oil_hwa_gipa2_dither[index].Kdata = (unsigned char *)Data[0];
+    oil_hwa_gipa2_dither[index].Klength = (int16)Length[0];
+    oil_hwa_gipa2_dither[index].Kwidth = CellSize[0][0];
+    oil_hwa_gipa2_dither[index].Kheight = CellSize[0][1];
 
     /* Cyan Data */
-    oil_hwa_gipa2_dither.Cdata = (unsigned char *)Data[1];
-    oil_hwa_gipa2_dither.Clength = (int16)Length[1];
-    oil_hwa_gipa2_dither.Cwidth = CellSize[1][0];
-    oil_hwa_gipa2_dither.Cheight = CellSize[1][1];
+    oil_hwa_gipa2_dither[index].Cdata = (unsigned char *)Data[1];
+    oil_hwa_gipa2_dither[index].Clength = (int16)Length[1];
+    oil_hwa_gipa2_dither[index].Cwidth = CellSize[1][0];
+    oil_hwa_gipa2_dither[index].Cheight = CellSize[1][1];
 
     /* Magenta Data */
-    oil_hwa_gipa2_dither.Mdata = (unsigned char *)Data[2];
-    oil_hwa_gipa2_dither.Mlength = (int16)Length[2];
-    oil_hwa_gipa2_dither.Mwidth = CellSize[2][0];
-    oil_hwa_gipa2_dither.Mheight = CellSize[2][1];
+    oil_hwa_gipa2_dither[index].Mdata = (unsigned char *)Data[2];
+    oil_hwa_gipa2_dither[index].Mlength = (int16)Length[2];
+    oil_hwa_gipa2_dither[index].Mwidth = CellSize[2][0];
+    oil_hwa_gipa2_dither[index].Mheight = CellSize[2][1];
 
     /* Yelow Data */
-    oil_hwa_gipa2_dither.Ydata = (unsigned char *)Data[3];
-    oil_hwa_gipa2_dither.Ylength = (int16)Length[3];
-    oil_hwa_gipa2_dither.Ywidth = CellSize[3][0];
-    oil_hwa_gipa2_dither.Yheight = CellSize[3][1];
+    oil_hwa_gipa2_dither[index].Ydata = (unsigned char *)Data[3];
+    oil_hwa_gipa2_dither[index].Ylength = (int16)Length[3];
+    oil_hwa_gipa2_dither[index].Ywidth = CellSize[3][0];
+    oil_hwa_gipa2_dither[index].Yheight = CellSize[3][1];
 
-    *plength = sizeof(oil_hwa_gipa2_dither);
-    return (&oil_hwa_gipa2_dither);
+    *plength = sizeof(oil_hwa_gipa2_dither[index]);
+    return (&oil_hwa_gipa2_dither[index]);
   }
   else
   {

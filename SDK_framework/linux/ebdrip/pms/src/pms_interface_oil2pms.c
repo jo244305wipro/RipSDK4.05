@@ -86,8 +86,14 @@ extern const unsigned int g_hwa1_gamma_len;
 extern const unsigned char *g_hwa1_bgucr_data;
 extern const unsigned int g_hwa1_bgucr_len;
 extern const unsigned char *g_hwa1_dither_data[4];
+extern const unsigned char *g_hwa1_dither2_data[4];
+extern const unsigned char *g_hwa1_dither4_data[4];
 extern const unsigned char *g_hwa1_dither_cell[4];
+extern const unsigned char *g_hwa1_dither2_cell[4];
+extern const unsigned char *g_hwa1_dither4_cell[4];
 extern const unsigned int g_hwa1_dither_len [4];
+extern const unsigned int g_hwa1_dither2_len [4];
+extern const unsigned int g_hwa1_dither4_len [4];
 extern const unsigned char *g_hwa1_cell_data_1bpp[4];
 extern const unsigned int g_hwa1_cell_len_1bpp [4];
 extern const unsigned char *g_hwa1_cell_data_2bpp[4];
@@ -1825,10 +1831,20 @@ int PMS_GetResource(int eResourceType, int index, PMS_TyResource * pResource)
         result = (index > 1);
         break;
   case EPMS_HWA1_GIPA2_DITHER:          /* Rift HWA1 pointer for Dither data */
-        pResource->pData = (unsigned char *)OIL_HWA1_GIPA2_Dither(&(pResource->length), g_hwa1_dither_data, g_hwa1_dither_len, g_hwa1_dither_cell);
         pResource->id = index + 1;
+        if(pResource->id == 1)
+          pResource->pData = (unsigned char *)OIL_HWA1_GIPA2_Dither(&(pResource->length), g_hwa1_dither_data, g_hwa1_dither_len, g_hwa1_dither_cell, pResource->id);
+        else if ((pResource->id == 2))
+          pResource->pData = (unsigned char *)OIL_HWA1_GIPA2_Dither(&(pResource->length), g_hwa1_dither2_data, g_hwa1_dither2_len, g_hwa1_dither2_cell, pResource->id);
+        else if ((pResource->id == 4))
+          pResource->pData = (unsigned char *)OIL_HWA1_GIPA2_Dither(&(pResource->length), g_hwa1_dither4_data, g_hwa1_dither4_len, g_hwa1_dither4_cell, pResource->id);
+        else if(pResource->id == 3)
+        {
+          pResource->pData = NULL;
+          pResource->length = 0;
+        }
         pResource->ePriority = EPMS_Priority_Normal;
-        result = (pResource->pData) ? (index > 1) : -1;
+        result = pResource->id > 4 ;
         break;
   case EPMS_PCL5RESOURCE_API:
         if (index == 0) {

@@ -647,6 +647,8 @@ PMS_OFILES=\
  $(OBJ_DIR)/pms/pms_filesys.o \
  $(OBJ_DIR)/pms/hwa1_BGUCR.o \
  $(OBJ_DIR)/pms/hwa1_dither.o \
+ $(OBJ_DIR)/pms/hwa1_dither2.o \
+ $(OBJ_DIR)/pms/hwa1_dither4.o \
  $(OBJ_DIR)/pms/hwa1_gamma.o \
  $(OBJ_DIR)/pms/hwa1_cell1bit.o \
  $(OBJ_DIR)/pms/hwa1_cell2bit.o \
